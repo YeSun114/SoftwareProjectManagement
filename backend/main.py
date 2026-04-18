@@ -1,81 +1,195 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from schemas import GenerationRequest
-from graph import app as agent_workflow
-from utils import extract_text_from_file
+import json
+from typing import AsyncIterator, Optional
+
 import uvicorn
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
+
+from graph import app as agent_workflow
+from utils import SUPPORTED_FILE_EXTENSIONS, build_source_material, extract_text_from_file
 
 app = FastAPI(title="Brand-Consistent Content Agent API")
 
-def run_content_generation_agent(product_doc_text: str, content_type: str) -> dict:
-    """
-    具体的模型调用逻辑：只接收处理好的字符串，不关心 HTTP 请求和文件对象。
-    """
-    # 构造初始状态
-    initial_state = {
-        "product_doc": product_doc_text,
+
+def _init_state(source_material: str, content_type: str, user_prompt: str = "") -> dict:
+    return {
+        "source_material": source_material,
         "product_spec": "",
         "content_type": content_type,
+        "user_prompt": user_prompt or "",
         "messages": [],
-        "is_approved": False,
-        "final_data": {}
+        "is_review_approved": False,
+        "is_fact_checked": False,
+        "final_data": {},
+        "status_updates": [],
     }
 
-    # 触发 LangGraph 分析
+
+def _validate_upload(file: UploadFile) -> None:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="上传文件缺少文件名")
+
+    lower_name = file.filename.lower()
+    if not any(lower_name.endswith(ext) for ext in SUPPORTED_FILE_EXTENSIONS):
+        allow = ", ".join(sorted(SUPPORTED_FILE_EXTENSIONS))
+        raise HTTPException(status_code=400, detail=f"仅支持以下文件格式：{allow}")
+
+
+def _prepare_source_material(
+    file_bytes: Optional[bytes],
+    filename: Optional[str],
+    source_url: str,
+    raw_text: str,
+) -> str:
+    file_text = ""
+    if file_bytes and filename:
+        file_text = extract_text_from_file(file_bytes, filename)
+
+    return build_source_material(
+        file_text=file_text,
+        source_url=source_url,
+        raw_text=raw_text,
+    )
+
+
+def run_content_generation_agent(
+    source_material: str,
+    content_type: str,
+    user_prompt: str = "",
+) -> dict:
+    initial_state = _init_state(
+        source_material=source_material,
+        content_type=content_type,
+        user_prompt=user_prompt,
+    )
     try:
-        result = agent_workflow.invoke(initial_state, {"recursion_limit": 10})
-        return result["final_data"]
+        result = agent_workflow.invoke(initial_state, {"recursion_limit": 14})
+        return {
+            "final_data": result.get("final_data", {}),
+            "product_spec": result.get("product_spec", ""),
+            "status_updates": result.get("status_updates", []),
+        }
     except Exception as e:
-        # 这里可以记录大模型调用失败的日志
         import traceback
         traceback.print_exc()
         raise RuntimeError(f"大模型内容生成失败: {str(e)}")
 
+
+async def stream_content_generation_agent(
+    source_material: str,
+    content_type: str,
+    user_prompt: str = "",
+) -> AsyncIterator[str]:
+    initial_state = _init_state(
+        source_material=source_material,
+        content_type=content_type,
+        user_prompt=user_prompt,
+    )
+
+    try:
+        async for chunk in agent_workflow.astream(initial_state, stream_mode="updates"):
+            # chunk 形如：{"node_name": {"status_updates": [...], ...}}
+            for node_name, payload in chunk.items():
+                status_updates = payload.get("status_updates", []) if isinstance(payload, dict) else []
+                for status in status_updates:
+                    yield f"data: {json.dumps({'event': 'status', 'node': node_name, 'message': status}, ensure_ascii=False)}\n\n"
+
+                if isinstance(payload, dict) and payload.get("final_data"):
+                    yield f"data: {json.dumps({'event': 'result', 'node': node_name, 'data': payload['final_data']}, ensure_ascii=False)}\n\n"
+
+        yield f"data: {json.dumps({'event': 'done'}, ensure_ascii=False)}\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'event': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+
+
 @app.post("/generate_from_file")
 async def generate_content_from_file(
-    content_type: str = Form(..., description="要生成的内容类型 (例如: blog, video)"),
-    file: UploadFile = File(..., description="上传的PDF或Word文档")
-    # 如果未来需要额外的前端输入/提示词，可以直接在这里加一个参数：
-    # user_prompt: str = Form("", description="用户额外的补充提示词")
+    content_type: str = Form(..., description="要生成的内容类型，例如 blog / video / case_study"),
+    file: UploadFile | None = File(None, description="可选：上传 PDF / Word / 图片文件"),
+    source_url: str = Form("", description="可选：产品网页 URL"),
+    raw_text: str = Form("", description="可选：直接粘贴的产品资料文本"),
+    user_prompt: str = Form("", description="可选：品牌约束、口吻要求、禁用词、额外提示词"),
 ):
     try:
-        # 第一关：前置校验文件合法性，不合法直接打回（不走大模型）
-        if not (file.filename.endswith(".pdf") or file.filename.endswith(".docx")):
-            raise HTTPException(status_code=400, detail="只允许上传 .pdf 或 .docx 文件")
+        file_bytes = None
+        filename = None
 
-        # 第二关：读取与解析文件，不合法直接打回
-        file_bytes = await file.read()
-        try:
-            product_doc_text = extract_text_from_file(file_bytes, file.filename)
-        except ValueError as ve:
-             raise HTTPException(status_code=400, detail=str(ve))
-             
-        if not product_doc_text or not product_doc_text.strip():
-            raise HTTPException(status_code=400, detail="无法从文件中提取到有效文本，文件可能为空。")
+        if file is not None:
+            _validate_upload(file)
+            file_bytes = await file.read()
+            filename = file.filename
+            if not file_bytes:
+                raise HTTPException(status_code=400, detail="上传文件为空")
 
-        # 第三关：文件处理完毕且合法，调用封装好的业务函数
-        # (如果传入了额外的 user_prompt，你可以把 product_doc_text 和 user_prompt 拼接后传给模型)
-        final_data = run_content_generation_agent(
-            product_doc_text=product_doc_text, 
-            content_type=content_type
+        source_material = _prepare_source_material(
+            file_bytes=file_bytes,
+            filename=filename,
+            source_url=source_url,
+            raw_text=raw_text,
         )
 
-        # 正常返回
+        result = run_content_generation_agent(
+            source_material=source_material,
+            content_type=content_type,
+            user_prompt=user_prompt,
+        )
+
         return {
             "status": "success",
             "content_type": content_type,
-            "filename": file.filename,
-            "data": final_data
+            "filename": filename,
+            "source_url": source_url or None,
+            "data": result["final_data"],
+            "product_spec": result["product_spec"],
+            "trace": result["status_updates"],
         }
-
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except HTTPException:
-        # 将我们主动抛出的 400 错误原样抛出给前端
         raise
     except RuntimeError as re:
-        # 捕获大模型崩溃的异常
         raise HTTPException(status_code=500, detail=str(re))
-    except Exception as e:
-        # 捕获其他未知错误
+    except Exception:
         raise HTTPException(status_code=500, detail="服务器内部发生了意外错误。")
 
+
+@app.post("/generate_stream")
+async def generate_content_stream(
+    content_type: str = Form(..., description="要生成的内容类型，例如 blog / video / case_study"),
+    file: UploadFile | None = File(None, description="可选：上传 PDF / Word / 图片文件"),
+    source_url: str = Form("", description="可选：产品网页 URL"),
+    raw_text: str = Form("", description="可选：直接粘贴的产品资料文本"),
+    user_prompt: str = Form("", description="可选：品牌约束、口吻要求、禁用词、额外提示词"),
+):
+    try:
+        file_bytes = None
+        filename = None
+
+        if file is not None:
+            _validate_upload(file)
+            file_bytes = await file.read()
+            filename = file.filename
+            if not file_bytes:
+                raise HTTPException(status_code=400, detail="上传文件为空")
+
+        source_material = _prepare_source_material(
+            file_bytes=file_bytes,
+            filename=filename,
+            source_url=source_url,
+            raw_text=raw_text,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    generator = stream_content_generation_agent(
+        source_material=source_material,
+        content_type=content_type,
+        user_prompt=user_prompt,
+    )
+    return StreamingResponse(generator, media_type="text/event-stream")
+
+
 if __name__ == "__main__":
+    # 启动方法：在backend目录下执行uvicorn main:app --reload --host 0.0.0.0 --port 8000
+    print("http://localhost:8000/docs")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
